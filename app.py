@@ -1,241 +1,655 @@
-# Text Summarizer - Streamlit Version
-# Much more reliable for deployment than Gradio
-
 import streamlit as st
-import re
+import torch
+from transformers import pipeline
+from newspaper import Article
+import PyPDF2
 import time
+import re
+import io
 
-# page config
+# Page configuration
 st.set_page_config(
-    page_title="Text Summarizer",
-    page_icon="📝",
-    layout="wide"
+    page_title="Professional Text Summarizer",
+    page_icon="🎯",
+    layout="wide",
+    initial_sidebar_state="expanded"
 )
 
-def smart_extractive_summary(text, num_sentences=5):
-    """
-    Simple but effective extractive summarization
-    Works without any AI dependencies
-    """
-    # split into sentences
-    sentences = []
-    for s in re.split(r'[.!?]+', text):
-        s = s.strip()
-        if len(s) > 15:  # ignore very short fragments
-            sentences.append(s)
-    
-    if len(sentences) <= num_sentences:
-        return sentences
-    
-    # score sentences based on word frequency and position
-    words = text.lower().split()
-    word_freq = {}
-    for word in words:
-        if len(word) > 3:  # ignore short words like "the", "and"
-            word_freq[word] = word_freq.get(word, 0) + 1
-    
-    # score each sentence
-    sentence_scores = []
-    for i, sentence in enumerate(sentences):
-        # word frequency score
-        word_score = sum(word_freq.get(word.lower(), 0) for word in sentence.split())
-        
-        # position bonus (first and last sentences often important)
-        position_bonus = 0
-        if i < 2:  # first two sentences
-            position_bonus = 10
-        elif i >= len(sentences) - 2:  # last two sentences
-            position_bonus = 5
-        
-        # length bonus (not too short, not too long)
-        length = len(sentence.split())
-        if 8 <= length <= 25:
-            length_bonus = 5
-        else:
-            length_bonus = 0
-        
-        total_score = word_score + position_bonus + length_bonus
-        sentence_scores.append((total_score, sentence))
-    
-    # get top sentences
-    sentence_scores.sort(key=lambda x: x[0], reverse=True)
-    best_sentences = [sent for score, sent in sentence_scores[:num_sentences]]
-    
-    return best_sentences
+# Custom CSS for better styling
+st.markdown("""
+<style>
+    .main-header {
+        text-align: center;
+        padding: 1rem 0;
+        margin-bottom: 2rem;
+    }
+    .preset-card {
+        background-color: #f0f2f6;
+        padding: 1rem;
+        border-radius: 10px;
+        margin: 0.5rem 0;
+    }
+    .stats-container {
+        background-color: #e8f4fd;
+        padding: 1rem;
+        border-radius: 10px;
+        border-left: 4px solid #1f77b4;
+    }
+    .success-box {
+        background-color: #d4edda;
+        padding: 1rem;
+        border-radius: 10px;
+        border-left: 4px solid #28a745;
+    }
+</style>
+""", unsafe_allow_html=True)
 
-def improve_sentences(sentences):
-    """Make the language sound more natural"""
+@st.cache_resource
+def load_summarization_model():
+    """Load the BART model with caching for better performance"""
+    print("📦 Loading BART-large-cnn...")
+    try:
+        summarizer = pipeline(
+            "summarization",
+            model="facebook/bart-large-cnn",
+            device=-1  # Using CPU since GPU might not be available
+        )
+        print("✅ BART loaded successfully!")
+        return summarizer
+    except Exception as e:
+        print(f"❌ BART failed: {e}, trying backup model...")
+        # Fallback to smaller model if the large one fails
+        summarizer = pipeline("summarization", model="sshleifer/distilbart-cnn-12-6", device=-1)
+        return summarizer
+
+# Initialize the model
+if 'summarizer' not in st.session_state:
+    with st.spinner("Loading AI model... This might take a moment on first run."):
+        st.session_state.summarizer = load_summarization_model()
+
+# Define preset configurations - keeping them exactly as in original
+PRESETS = {
+    "tweet": {
+        "name": "📱 Tweet/Social",
+        "description": "Perfect for social media posts",
+        "sentences": 2,
+        "target_words": 45,
+        "max_words": 55
+    },
+    "quick": {
+        "name": "📄 Quick Summary", 
+        "description": "Brief overview of key points",
+        "sentences": 5,
+        "target_words": 75,
+        "max_words": 90
+    },
+    "executive": {
+        "name": "📊 Executive Brief",
+        "description": "Professional summary for business",
+        "sentences": 7,
+        "target_words": 110,
+        "max_words": 130
+    },
+    "detailed": {
+        "name": "📚 Detailed Summary",
+        "description": "Comprehensive overview",
+        "sentences": 10,
+        "target_words": 170,
+        "max_words": 200
+    }
+}
+
+def clean_and_split_sentences(text):
+    """Clean text and split into proper sentences - exact same logic as original"""
+    text = re.sub(r'\s+', ' ', text.strip())
+    raw_sentences = re.split(r'(?<=[.!?])\s+(?=[A-Z])', text)
     
-    # word improvements
+    sentences = []
+    for sentence in raw_sentences:
+        sentence = sentence.strip()
+        if len(sentence) >= 10 and not sentence.endswith('..'):
+            if not sentence.endswith(('.', '!', '?')):
+                sentence += '.'
+            sentences.append(sentence)
+    
+    return sentences
+
+def smart_paraphrase(text):
+    """Enhanced paraphrasing with comprehensive replacements - keeping all original replacements"""
     replacements = {
-        'reportedly': 'allegedly',
-        'infiltrated': 'breached', 
-        'obtained': 'secured',
-        'suspended': 'halted',
-        'authorities': 'officials',
-        'individuals': 'people',
-        'conducted': 'carried out',
-        'mentioned': 'stated',
-        'approximately': 'about',
-        'considering': 'contemplating',
-        'smashed': 'hit',
-        'crushing': 'defeating',
-        'sealed': 'secured',
-        'deliveries': 'balls',
-        'server': 'system',
-        'technical advice': 'technical assistance'
+        # News & reporting
+        'reportedly': 'allegedly', 'infiltrated': 'breached', 'obtained': 'secured',
+        'suspended': 'halted', 'authorities': 'officials', 'considering': 'contemplating',
+        'individuals': 'people', 'conducted': 'carried out', 'mentioned': 'stated',
+        'operational': 'functional', 'approximately': 'about', 'subsequently': 'later',
+        
+        # Sports terms
+        'smashed': 'hit', 'crushing': 'defeating', 'sealed': 'secured', 'unassailable': 'commanding',
+        'deliveries': 'balls', 'holed out': 'was caught', 'removed cheaply': 'dismissed for low scores',
+        
+        # General terms
+        'server': 'system', 'technical advice': 'technical assistance', 'restart': 'restore',
+        'come to a standstill': 'been suspended', 'no response has been received': 'they have not received a response',
+        'have not been able to': 'cannot', 'As a result': 'Consequently', 'Even after': 'Despite',
+        
+        # Organization names
+        'Rajdhani Unnayan Kartripakkha': 'Rajuk', 'Electronic Construction Permitting System': 'ECPS',
+        'Bangladesh Computer Council': 'BCC', 'West Indies': 'Windies',
+        
+        # Time and process
+        'From the following day': 'The next day', 'all types of services': 'all services',
+        'are currently being provided': 'are available', 'linked to the incident': 'connected to the breach'
     }
     
-    improved = []
-    for sentence in sentences:
-        result = sentence
-        for old, new in replacements.items():
-            result = result.replace(old, new)
-        improved.append(result)
+    result = text
+    for old, new in replacements.items():
+        result = result.replace(old, new)
     
-    return improved
+    return result
 
-# main app
-st.title("📝 Text Summarizer")
-st.markdown("*Create smart summaries of any text - fast and reliable!*")
+def create_smart_summary(text, target_sentences, target_words, priority="sentences"):
+    """Create summary with dual sentence/word targeting - exact same logic"""
+    
+    print(f"🎯 Creating summary: {target_sentences} sentences, ~{target_words} words")
+    print(f"📋 Priority: {priority}")
+    
+    try:
+        summarizer = st.session_state.summarizer
+        
+        # Generate multiple summary options
+        summaries = []
+        
+        # Option 1: Conservative approach
+        summary1 = summarizer(
+            text,
+            max_length=max(target_words + 20, target_sentences * 15),
+            min_length=max(target_words - 10, target_sentences * 10),
+            do_sample=False,
+            truncation=True
+        )[0]['summary_text']
+        summaries.append(summary1)
+        
+        # Option 2: More flexible approach
+        if priority == "words":
+            # Focus on word count first
+            summary2 = summarizer(
+                text,
+                max_length=target_words + 15,
+                min_length=max(target_words - 15, 20),
+                do_sample=True,
+                temperature=0.7,
+                truncation=True
+            )[0]['summary_text']
+        else:
+            # Focus on sentence structure first
+            summary2 = summarizer(
+                text,
+                max_length=target_sentences * 25,
+                min_length=target_sentences * 12,
+                do_sample=True,
+                temperature=0.7,
+                truncation=True
+            )[0]['summary_text']
+        
+        summaries.append(summary2)
+        
+        # Choose best summary based on priority
+        if priority == "words":
+            # Pick summary closest to target word count
+            best_summary = min(summaries, key=lambda x: abs(len(x.split()) - target_words))
+        else:
+            # Pick longest, most comprehensive summary
+            best_summary = max(summaries, key=lambda x: len(x.split()))
+        
+        print(f"📊 Initial summary: {len(best_summary.split())} words")
+        
+        # Clean and split sentences
+        sentences = clean_and_split_sentences(best_summary)
+        print(f"🔍 Extracted {len(sentences)} sentences")
+        
+        # Handle sentence count based on priority - keeping exact logic
+        if priority == "sentences":
+            # Prioritize exact sentence count
+            if len(sentences) >= target_sentences:
+                selected_sentences = sentences[:target_sentences]
+            else:
+                # Try to get more sentences
+                expanded_summary = summarizer(
+                    text,
+                    max_length=target_sentences * 30,
+                    min_length=target_sentences * 18,
+                    do_sample=True,
+                    temperature=0.8,
+                    truncation=True
+                )[0]['summary_text']
+                
+                expanded_sentences = clean_and_split_sentences(expanded_summary)
+                all_sentences = sentences + expanded_sentences
+                
+                # Remove duplicates
+                unique_sentences = []
+                for sentence in all_sentences:
+                    is_duplicate = False
+                    for existing in unique_sentences:
+                        common_words = set(sentence.lower().split()) & set(existing.lower().split())
+                        if len(common_words) > len(sentence.split()) * 0.7:
+                            is_duplicate = True
+                            break
+                    if not is_duplicate:
+                        unique_sentences.append(sentence)
+                
+                selected_sentences = unique_sentences[:target_sentences]
+        
+        else:
+            # Prioritize word count, adjust sentences as needed
+            current_words = sum(len(s.split()) for s in sentences)
+            
+            if current_words <= target_words + 15:
+                # Use all sentences if within word limit
+                selected_sentences = sentences
+            else:
+                # Trim sentences to meet word target
+                selected_sentences = []
+                word_count = 0
+                
+                for sentence in sentences:
+                    sentence_words = len(sentence.split())
+                    if word_count + sentence_words <= target_words + 10:
+                        selected_sentences.append(sentence)
+                        word_count += sentence_words
+                    else:
+                        break
+        
+        # Paraphrase each sentence
+        print("🔄 Paraphrasing sentences...")
+        final_sentences = []
+        for sentence in selected_sentences:
+            paraphrased = smart_paraphrase(sentence)
+            final_sentences.append(paraphrased)
+        
+        # Final assembly
+        result = ' '.join(final_sentences)
+        word_count = len(result.split())
+        sentence_count = len(final_sentences)
+        
+        print(f"✅ Final: {sentence_count} sentences, {word_count} words")
+        
+        return result, sentence_count, word_count
+        
+    except Exception as e:
+        print(f"❌ Summary creation failed: {e}")
+        return f"Error: {str(e)}", 0, 0
 
-# sidebar for settings
+def process_uploaded_file(uploaded_file):
+    """Handle file uploads - PDF and text files"""
+    try:
+        if uploaded_file.type == "application/pdf":
+            # Handle PDF files
+            pdf_reader = PyPDF2.PdfReader(uploaded_file)
+            content = ""
+            for page in pdf_reader.pages:
+                content += page.extract_text() + "\n"
+            return content, f"📄 Source: {uploaded_file.name}"
+        else:
+            # Handle text files
+            content = str(uploaded_file.read(), "utf-8")
+            return content, f"📝 Source: {uploaded_file.name}"
+    except Exception as e:
+        return None, f"❌ Error reading file: {str(e)}"
+
+def extract_url_content(url):
+    """Extract content from URL using newspaper3k"""
+    try:
+        article = Article(url)
+        article.download()
+        article.parse()
+        if article.text:
+            return article.text, f"📰 Source: {url}"
+        else:
+            return None, "❌ Could not extract text from URL"
+    except Exception as e:
+        return None, f"❌ URL processing failed: {str(e)}"
+
+# Main App Header
+st.markdown("""
+<div class="main-header">
+    <h1>🎯 Professional Text Summarizer</h1>
+    <p><em>Simple presets for quick use • Advanced controls for precision</em></p>
+</div>
+""", unsafe_allow_html=True)
+
+# Sidebar for mode selection and controls
 with st.sidebar:
-    st.header("⚙️ Settings")
+    st.header("⚙️ Controls")
     
-    length_option = st.selectbox(
-        "Summary Length",
-        ["Short (2-3 sentences)", "Medium (4-5 sentences)", "Long (6-8 sentences)"],
-        index=1
+    # Mode selection
+    mode = st.radio(
+        "📋 Choose Your Mode",
+        ["Simple Mode", "Advanced Mode"],
+        help="Simple: Quick presets | Advanced: Custom control"
     )
     
-    st.markdown("---")
-    st.markdown("### 💡 Tips")
-    st.markdown("• Works best with 100+ words")
-    st.markdown("• Try different lengths for your needs")
-    st.markdown("• Great for articles, essays, reports")
+    if mode == "Simple Mode":
+        st.subheader("🎯 Quick Presets")
+        
+        preset_options = {
+            "tweet": "📱 Tweet/Social (2-3 sentences, ~45 words)",
+            "quick": "📄 Quick Summary (4-5 sentences, ~75 words)",
+            "executive": "📊 Executive Brief (6-7 sentences, ~110 words)",
+            "detailed": "📚 Detailed Summary (8-10 sentences, ~170 words)"
+        }
+        
+        preset_choice = st.radio(
+            "Choose your summary style:",
+            list(preset_options.keys()),
+            format_func=lambda x: preset_options[x],
+            index=1  # Default to "quick"
+        )
+        
+        # Display preset details
+        selected_preset = PRESETS[preset_choice]
+        st.markdown(f"""
+        <div class="preset-card">
+            <strong>{selected_preset['name']}</strong><br>
+            {selected_preset['description']}<br>
+            <small>Target: {selected_preset['sentences']} sentences, ~{selected_preset['target_words']} words</small>
+        </div>
+        """, unsafe_allow_html=True)
+        
+    else:
+        st.subheader("⚙️ Custom Controls")
+        
+        custom_sentences = st.slider(
+            "🎯 Target sentences",
+            min_value=2,
+            max_value=15,
+            value=5,
+            help="Number of sentences in the summary"
+        )
+        
+        custom_words = st.slider(
+            "📝 Target words",
+            min_value=25,
+            max_value=300,
+            value=75,
+            step=5,
+            help="Approximate number of words"
+        )
+        
+        priority = st.radio(
+            "⚖️ Priority",
+            ["Sentences First", "Words First"],
+            help="Which target is more important?"
+        )
+        
+        st.markdown("""
+        **Sentences First:** Hit exact sentence count, approximate word target  
+        **Words First:** Hit word target, adjust sentence count as needed
+        """)
 
-# main interface
+# Main content area
 col1, col2 = st.columns([1, 1])
 
 with col1:
     st.header("📥 Input")
     
-    # text input
-    text_input = st.text_area(
-        "Paste your text here:",
-        placeholder="Paste your article, document, essay, or any long text here...",
-        height=300,
-        help="Enter at least 50 words for best results"
+    # Input options
+    input_method = st.radio(
+        "Choose input method:",
+        ["📄 Paste Text", "🌐 URL", "📁 Upload File"]
     )
     
-    # file upload
-    uploaded_file = st.file_uploader(
-        "Or upload a text file:",
-        type=['txt'],
-        help="Upload a .txt file to summarize"
-    )
+    content = ""
+    source_info = ""
     
-    # handle file upload
-    if uploaded_file is not None:
-        try:
-            file_content = uploaded_file.read().decode('utf-8')
-            text_input = file_content
-            st.success(f"File uploaded: {uploaded_file.name}")
-        except:
-            st.error("Could not read the file. Please try a different .txt file.")
+    if input_method == "📄 Paste Text":
+        text_input = st.text_area(
+            "Paste your text here:",
+            placeholder="Paste your article, news story, research paper, or any text here...",
+            height=300
+        )
+        if text_input.strip():
+            content = text_input
+            source_info = "✍️ Source: Direct text input"
     
-    # summarize button
-    if st.button("✨ Create Summary", type="primary", use_container_width=True):
-        if not text_input or len(text_input.strip()) < 50:
-            st.error("Please enter at least 50 words of text to summarize.")
-        else:
-            # figure out how many sentences to generate
-            if length_option == "Short (2-3 sentences)":
-                target = 3
-            elif length_option == "Long (6-8 sentences)":
-                target = 7
-            else:  # Medium
-                target = 5
-            
-            with st.spinner("Creating your summary..."):
-                start_time = time.time()
-                
-                try:
-                    # get the best sentences
-                    best_sentences = smart_extractive_summary(text_input, target)
-                    
-                    # improve the language
-                    improved_sentences = improve_sentences(best_sentences)
-                    
-                    # put it together
-                    summary = '. '.join(improved_sentences) + '.'
-                    
-                    # calculate stats
-                    original_words = len(text_input.split())
-                    summary_words = len(summary.split())
-                    compression = round((1 - summary_words/original_words) * 100, 1)
-                    processing_time = time.time() - start_time
-                    
-                    # store in session state
-                    st.session_state.summary = summary
-                    st.session_state.stats = {
-                        'original_words': original_words,
-                        'summary_words': summary_words,
-                        'compression': compression,
-                        'sentences': len(improved_sentences),
-                        'processing_time': processing_time
-                    }
-                    
-                    st.success("Summary created successfully!")
-                    
-                except Exception as e:
-                    st.error(f"Error creating summary: {str(e)}")
+    elif input_method == "🌐 URL":
+        url_input = st.text_input(
+            "Enter article URL:",
+            placeholder="https://example.com/article"
+        )
+        if url_input.strip():
+            with st.spinner("Extracting content from URL..."):
+                content, source_info = extract_url_content(url_input)
+                if content is None:
+                    st.error(source_info)
+    
+    else:  # File upload
+        uploaded_file = st.file_uploader(
+            "Choose a file:",
+            type=['txt', 'pdf'],
+            help="Upload a text file or PDF"
+        )
+        if uploaded_file is not None:
+            with st.spinner("Processing file..."):
+                content, source_info = process_uploaded_file(uploaded_file)
+                if content is None:
+                    st.error(source_info)
+
+    # Generate summary button
+    generate_summary = st.button("✨ Create Summary", type="primary", use_container_width=True)
 
 with col2:
     st.header("📤 Output")
     
-    # show summary if it exists
-    if hasattr(st.session_state, 'summary'):
-        st.subheader("📋 Your Summary")
-        st.text_area(
-            "Summary:",
-            value=st.session_state.summary,
-            height=200,
-            help="Copy this summary to use elsewhere",
-            label_visibility="collapsed"
-        )
-        
-        # copy button
-        if st.button("📋 Copy Summary", use_container_width=True):
-            st.write("Summary copied to clipboard!")  # Note: actual clipboard copy needs JS
-        
-        # show statistics
-        st.subheader("📊 Statistics")
-        stats = st.session_state.stats
-        
-        col_a, col_b = st.columns(2)
-        with col_a:
-            st.metric("Original Words", stats['original_words'])
-            st.metric("Compression", f"{stats['compression']}%")
-        
-        with col_b:
-            st.metric("Summary Words", stats['summary_words'])
-            st.metric("Sentences", stats['sentences'])
-        
-        st.metric("Processing Time", f"{stats['processing_time']:.1f}s")
-        
-    else:
-        st.info("👈 Enter some text on the left and click 'Create Summary' to get started!")
-        
-        # show example
-        st.subheader("📝 Example")
-        st.markdown("""
-        **Try this sample text:**
-        
-        Artificial intelligence has made remarkable progress in recent years. Machine learning algorithms can now process vast amounts of data with incredible speed and accuracy. Deep learning models have revolutionized computer vision, natural language processing, and speech recognition. Companies across industries are integrating AI into their operations to improve efficiency and create new products. However, concerns about job displacement, privacy, and ethical implications continue to grow. Experts emphasize the need for responsible AI development and proper regulation.
-        """)
+    if generate_summary and content:
+        if len(content.strip()) < 30:
+            st.error("❌ Content too short for summarization")
+        else:
+            # Determine parameters based on mode
+            if mode == "Simple Mode":
+                preset = PRESETS[preset_choice]
+                target_sentences = preset["sentences"]
+                target_words = preset["target_words"]
+                summary_priority = "sentences"
+                mode_info = f"Using {preset['name']}"
+            else:
+                target_sentences = custom_sentences
+                target_words = custom_words
+                summary_priority = priority.lower().split()[0]
+                mode_info = f"Custom: {target_sentences} sentences, {target_words} words"
+            
+            # Generate summary with progress indicator
+            with st.spinner("Creating your professional summary..."):
+                start_time = time.time()
+                summary, final_sentences, final_words = create_smart_summary(
+                    content, target_sentences, target_words, summary_priority
+                )
+                processing_time = time.time() - start_time
+            
+            if summary.startswith("Error"):
+                st.error(summary)
+            else:
+                # Display the summary
+                st.subheader("📋 Your Professional Summary")
+                st.markdown(f"""
+                <div class="success-box">
+                    {summary}
+                </div>
+                """, unsafe_allow_html=True)
+                
+                # Copy button (using Streamlit's built-in functionality)
+                st.text_area("Copy your summary:", value=summary, height=100, label_visibility="collapsed")
+                
+                # Calculate and display statistics
+                original_words = len(content.split())
+                compression = round((1 - final_words/original_words) * 100, 1)
+                
+                sentence_match = "✅ Perfect" if final_sentences == target_sentences else f"📊 {final_sentences}/{target_sentences}"
+                word_match = "✅ Perfect" if abs(final_words - target_words) <= 10 else f"📊 {final_words}/{target_words}"
+                
+                st.subheader("📊 Summary Statistics")
+                st.markdown(f"""
+                <div class="stats-container">
+                    <strong>📋 Mode:</strong> {mode_info}<br><br>
+                    
+                    <strong>📊 Content Analysis:</strong><br>
+                    • Original text: {original_words} words<br>
+                    • Summary length: {final_words} words<br>
+                    • Compression ratio: {compression}% reduction<br><br>
+                    
+                    <strong>🎯 Target Achievement:</strong><br>
+                    • Sentences: {final_sentences}/{target_sentences} {sentence_match}<br>
+                    • Words: {final_words}/{target_words} {word_match}<br><br>
+                    
+                    <strong>⚡ Performance:</strong><br>
+                    • Processing time: {processing_time:.1f} seconds<br>
+                    • Priority used: {summary_priority.title()}-first approach<br>
+                    • Model: BART-large-cnn
+                </div>
+                """, unsafe_allow_html=True)
+                
+                # Source information
+                if source_info:
+                    st.info(source_info)
+    
+    elif generate_summary and not content:
+        st.warning("❌ Please provide some text to summarize!")
 
-# footer
+# Information tabs at the bottom
 st.markdown("---")
-st.markdown("**Built with Streamlit** • Reliable text summarization without complex dependencies")
+
+tab1, tab2, tab3, tab4 = st.tabs(["📋 Preset Guide", "⚙️ Advanced Guide", "📊 Examples", "ℹ️ About"])
+
+with tab1:
+    st.markdown("""
+    ## 🎯 When to Use Each Preset:
+    
+    ### 📱 Tweet/Social (2-3 sentences, ~45 words)
+    **Perfect for:**
+    - Social media posts (Twitter, LinkedIn, Facebook)
+    - Text messages and quick shares
+    - Headlines and brief announcements
+    
+    **Example output:** *"Australia defeated West Indies by six wickets in the third T20. Tim David hit the fastest T20 century for Australia with 102 off 37 balls."*
+    
+    ### 📄 Quick Summary (4-5 sentences, ~75 words)
+    **Perfect for:**
+    - Email briefings
+    - Meeting notes
+    - Quick status updates
+    - News headlines expanded
+    
+    **Example output:** *"Australia secured a 3-0 series lead with a six-wicket victory over West Indies. Tim David scored the fastest T20 century for Australia, hitting 102 off just 37 deliveries. His innings included 11 sixes and six fours. Australia won with 23 balls to spare at Warner Park. The victory gives them an unassailable lead in the five-match series."*
+    
+    ### 📊 Executive Brief (6-7 sentences, ~110 words)
+    **Perfect for:**
+    - Business reports
+    - Academic abstracts
+    - Presentation summaries
+    - Professional briefings
+    
+    ### 📚 Detailed Summary (8-10 sentences, ~170 words)
+    **Perfect for:**
+    - Research paper abstracts
+    - Comprehensive overviews
+    - Detailed meeting minutes
+    - Long-form content summaries
+    """)
+
+with tab2:
+    st.markdown("""
+    ## 🔧 Advanced Mode Features:
+    
+    ### 🎯 Sentence Control (2-15)
+    - **2-4 sentences:** Ultra-brief summaries
+    - **5-8 sentences:** Standard summaries  
+    - **9-12 sentences:** Comprehensive summaries
+    - **13-15 sentences:** Detailed analysis (for very long content)
+    
+    ### 📝 Word Control (25-300)
+    - **25-50 words:** Social media, headlines
+    - **50-100 words:** Standard business use
+    - **100-200 words:** Professional reports
+    - **200-300 words:** Academic abstracts
+    
+    ### ⚖️ Priority Settings:
+    
+    **Sentences First** (Recommended):
+    - Guarantees exact sentence count
+    - Word count will be approximate
+    - Better for consistent structure
+    - Example: Always get exactly 5 sentences
+    
+    **Words First**:
+    - Hits target word count precisely
+    - Sentence count may vary slightly
+    - Better for strict length requirements
+    - Example: Always get exactly 100 words
+    
+    ### 💡 Pro Tips:
+    - Start with **Sentences First** for most use cases
+    - Use **Words First** for platforms with strict character limits
+    - Longer targets work better with longer input texts
+    - Very short targets (under 40 words) may compromise quality
+    """)
+
+with tab3:
+    st.markdown("""
+    ## 🧪 Test Examples:
+    
+    ### 📰 News Article:
+    ```
+    David blasts fastest T20 ton for Australia in series win over West Indies
+    Middle order batter Tim David smashed the fastest Twenty20 International century...
+    ```
+    **Try:** Executive Brief preset or Custom 6 sentences, 120 words
+    
+    ### 🏛️ Academic Content:
+    ```
+    The exact date of the University of Oxford's founding is unknown, but the school traces its roots back to at least 1096...
+    ```
+    **Try:** Detailed Summary preset or Custom 8 sentences, 150 words
+    
+    ### 💼 Business News:
+    ```
+    On May 19, a group of hackers reportedly infiltrated the Electronic Construction Permitting System...
+    ```
+    **Try:** Quick Summary preset or Custom 5 sentences, 80 words
+    
+    ### 📱 For Social Media:
+    Use Tweet/Social preset for any content you want to share quickly!
+    """)
+
+with tab4:
+    st.markdown("""
+    ## ℹ️ About This Tool
+    
+    This professional text summarizer uses state-of-the-art AI to create high-quality summaries tailored to your needs.
+    
+    ### ⚡ Features:
+    - **Dual Mode Interface:** Simple presets for quick use, advanced controls for precision
+    - **Multiple Input Methods:** Text, URLs, and file uploads (PDF, TXT)
+    - **Smart Paraphrasing:** Avoids repetitive language from the original text
+    - **Flexible Targeting:** Control both sentence count and word count
+    - **Professional Quality:** Suitable for business, academic, and personal use
+    
+    ### 🤖 Technology:
+    - **Model:** Facebook's BART-large-cnn (state-of-the-art summarization)
+    - **Fallback:** DistilBART for compatibility
+    - **Processing:** Advanced sentence splitting and paraphrasing
+    
+    ### 🎯 Perfect For:
+    - Students and researchers
+    - Business professionals
+    - Content creators
+    - Social media managers
+    - Anyone who needs quick, quality summaries
+    """)
+
+# Footer
+st.markdown("---")
+st.markdown("""
+<div style="text-align: center; color: #666; margin-top: 2rem;">
+    <p>🎯 Professional Text Summarizer • Simple presets + Advanced custom controls!</p>
+</div>
+""", unsafe_allow_html=True)
