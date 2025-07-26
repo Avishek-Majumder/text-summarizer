@@ -1,4 +1,2 @@
 streamlit
 requests
-newspaper3k
-PyPDF2
