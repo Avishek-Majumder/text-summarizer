@@ -17,7 +17,81 @@ try:
 except ImportError:
     PYPDF2_AVAILABLE = False
 
-# Basic URL content extraction without newspaper3k
+try:
+    from bs4 import BeautifulSoup
+    BS4_AVAILABLE = True
+except ImportError:
+    BS4_AVAILABLE = False
+
+try:
+    from docx import Document
+    DOCX_AVAILABLE = True
+except ImportError:
+    DOCX_AVAILABLE = False
+
+# Enhanced URL content extraction
+def extract_url_content_enhanced(url):
+    """Extract content from URL using BeautifulSoup for better results"""
+    try:
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.5',
+            'Accept-Encoding': 'gzip, deflate',
+            'Connection': 'keep-alive'
+        }
+        
+        response = requests.get(url, timeout=15, headers=headers)
+        response.raise_for_status()
+        
+        if BS4_AVAILABLE:
+            soup = BeautifulSoup(response.content, 'html.parser')
+            
+            # Remove unwanted elements
+            for element in soup(['script', 'style', 'nav', 'header', 'footer', 'aside', 'advertisement']):
+                element.decompose()
+            
+            # Try to find main content areas
+            content_areas = (
+                soup.find('article') or 
+                soup.find('main') or 
+                soup.find('div', class_=re.compile(r'content|article|post|story', re.I)) or
+                soup.find('div', id=re.compile(r'content|article|post|story', re.I))
+            )
+            
+            if content_areas:
+                # Extract text from paragraphs within content area
+                paragraphs = content_areas.find_all(['p', 'div'], string=True)
+                content_text = []
+                
+                for p in paragraphs:
+                    text = p.get_text().strip()
+                    if len(text) > 50:  # Only meaningful paragraphs
+                        content_text.append(text)
+                
+                if content_text:
+                    result = '\n\n'.join(content_text[:15])  # First 15 paragraphs
+                else:
+                    # Fallback to all paragraphs
+                    all_paragraphs = soup.find_all('p')
+                    content_text = [p.get_text().strip() for p in all_paragraphs if len(p.get_text().strip()) > 30]
+                    result = '\n\n'.join(content_text[:20])
+            else:
+                # Fallback to all text
+                result = soup.get_text()
+                # Clean up excessive whitespace
+                result = re.sub(r'\n\s*\n', '\n\n', result)
+                result = re.sub(r' +', ' ', result)
+            
+            return result.strip(), f"📰 Source: {url}"
+        else:
+            # Fallback to basic extraction
+            return extract_url_content_basic(url)
+            
+    except Exception as e:
+        return None, f"❌ Enhanced URL extraction failed: {str(e)}"
+
+# Basic URL content extraction without beautifulsoup
 def extract_url_content_basic(url):
     """Extract content from URL using basic requests and regex"""
     try:
@@ -28,33 +102,50 @@ def extract_url_content_basic(url):
         
         html = response.text
         
-        # Basic HTML tag removal and text extraction
         # Remove script and style tags
         html = re.sub(r'<script.*?</script>', '', html, flags=re.DOTALL | re.IGNORECASE)
         html = re.sub(r'<style.*?</style>', '', html, flags=re.DOTALL | re.IGNORECASE)
+        html = re.sub(r'<nav.*?</nav>', '', html, flags=re.DOTALL | re.IGNORECASE)
+        html = re.sub(r'<header.*?</header>', '', html, flags=re.DOTALL | re.IGNORECASE)
+        html = re.sub(r'<footer.*?</footer>', '', html, flags=re.DOTALL | re.IGNORECASE)
         
-        # Remove HTML tags
+        # Extract text from paragraphs specifically
+        paragraphs = re.findall(r'<p[^>]*>(.*?)</p>', html, re.DOTALL | re.IGNORECASE)
+        
+        if paragraphs:
+            # Clean each paragraph
+            clean_paragraphs = []
+            for p in paragraphs:
+                # Remove HTML tags from paragraph
+                clean_p = re.sub(r'<[^>]+>', '', p)
+                clean_p = re.sub(r'\s+', ' ', clean_p).strip()
+                
+                # Only keep substantial paragraphs
+                if len(clean_p) > 30 and not clean_p.lower().startswith(('cookie', 'advertisement', 'subscribe')):
+                    clean_paragraphs.append(clean_p)
+            
+            if clean_paragraphs:
+                return '\n\n'.join(clean_paragraphs[:15]), f"📰 Source: {url}"
+        
+        # Fallback: remove all HTML tags
         text = re.sub(r'<[^>]+>', '', html)
-        
-        # Clean up whitespace
         text = re.sub(r'\s+', ' ', text)
         text = text.strip()
         
-        # Basic content extraction - look for paragraphs
-        lines = text.split('\n')
-        content_lines = []
+        # Split into sentences and take meaningful ones
+        sentences = re.split(r'[.!?]+', text)
+        good_sentences = []
         
-        for line in lines:
-            line = line.strip()
-            # Keep lines that are likely content (length check)
-            if len(line) > 50 and len(line) < 1000:
-                content_lines.append(line)
+        for sentence in sentences:
+            sentence = sentence.strip()
+            if 20 < len(sentence) < 500:  # Reasonable sentence length
+                good_sentences.append(sentence)
         
-        if content_lines:
-            content = '\n'.join(content_lines[:20])  # Take first 20 good lines
+        if good_sentences:
+            content = '. '.join(good_sentences[:25]) + '.'
             return content, f"📰 Source: {url}"
         else:
-            return text[:3000] if text else None, f"📰 Source: {url}"  # Fallback to first 3000 chars
+            return text[:2000] if text else None, f"📰 Source: {url}"
             
     except Exception as e:
         return None, f"❌ URL extraction failed: {str(e)}"
@@ -76,22 +167,30 @@ st.markdown("""
         margin-bottom: 2rem;
     }
     .preset-card {
-        background-color: #f0f2f6;
-        padding: 1rem;
+        background-color: #ffffff;
+        padding: 1.5rem;
         border-radius: 10px;
         margin: 0.5rem 0;
+        border: 1px solid #e9ecef;
+        color: #212529;
     }
     .stats-container {
-        background-color: #e8f4fd;
-        padding: 1rem;
+        background-color: #f8f9fa;
+        padding: 1.5rem;
         border-radius: 10px;
         border-left: 4px solid #1f77b4;
+        color: #212529;
+        border: 1px solid #e9ecef;
     }
     .success-box {
-        background-color: #d4edda;
-        padding: 1rem;
+        background-color: #f8f9fa;
+        padding: 1.5rem;
         border-radius: 10px;
         border-left: 4px solid #28a745;
+        color: #212529;
+        font-size: 16px;
+        line-height: 1.6;
+        border: 1px solid #e9ecef;
     }
     .warning-box {
         background-color: #fff3cd;
@@ -338,7 +437,7 @@ def create_smart_summary(text, target_sentences, target_words, priority="sentenc
     return create_basic_summary(text, target_sentences, target_words)
 
 def process_uploaded_file(uploaded_file):
-    """Handle file uploads with basic text extraction"""
+    """Handle file uploads with enhanced support"""
     try:
         if uploaded_file.type == "application/pdf":
             if PYPDF2_AVAILABLE:
@@ -350,6 +449,18 @@ def process_uploaded_file(uploaded_file):
                 return content, f"📄 Source: {uploaded_file.name}"
             else:
                 return None, "❌ PDF processing requires PyPDF2. Please try a text file or paste the content directly."
+        
+        elif uploaded_file.type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
+            if DOCX_AVAILABLE:
+                # Handle .docx files
+                doc = Document(uploaded_file)
+                content = ""
+                for paragraph in doc.paragraphs:
+                    content += paragraph.text + "\n"
+                return content, f"📄 Source: {uploaded_file.name}"
+            else:
+                return None, "❌ DOCX processing requires python-docx. Please try a text file."
+        
         else:
             # Handle text files and other formats
             try:
@@ -362,24 +473,34 @@ def process_uploaded_file(uploaded_file):
                     content = str(uploaded_file.read(), "latin-1")
                     return content, f"📝 Source: {uploaded_file.name}"
                 except:
-                    return None, "❌ Could not decode file. Please try a UTF-8 encoded text file."
+                    uploaded_file.seek(0)
+                    try:
+                        content = str(uploaded_file.read(), "cp1252")
+                        return content, f"📝 Source: {uploaded_file.name}"
+                    except:
+                        return None, "❌ Could not decode file. Please try a UTF-8 encoded text file."
     except Exception as e:
         return None, f"❌ Error reading file: {str(e)}"
 
 def extract_url_content(url):
-    """Extract content from URL using available methods"""
+    """Extract content from URL using best available method"""
     if NEWSPAPER_AVAILABLE:
         try:
             article = Article(url)
             article.download()
             article.parse()
-            if article.text:
-                return article.text, f"📰 Source: {url}"
+            if article.text and len(article.text.strip()) > 100:
+                return article.text, f"📰 Source: {url} (Advanced extraction)"
         except Exception as e:
-            # Fall back to basic extraction
-            pass
+            pass  # Fall back to other methods
     
-    # Use basic extraction method
+    # Try enhanced extraction with BeautifulSoup
+    if BS4_AVAILABLE:
+        result = extract_url_content_enhanced(url)
+        if result[0] and not result[1].startswith("❌"):
+            return result[0], f"📰 Source: {url} (Enhanced extraction)"
+    
+    # Fall back to basic extraction
     return extract_url_content_basic(url)
 
 # Main App Header
@@ -425,12 +546,19 @@ with st.expander("🔧 System Status", expanded=False):
     ai_status = "✅ Available (Hugging Face API)"
     
     if NEWSPAPER_AVAILABLE:
-        url_status = "✅ Available (Advanced)"
+        url_status = "✅ Available (Advanced - newspaper3k)"
+    elif BS4_AVAILABLE:
+        url_status = "✅ Available (Enhanced - BeautifulSoup)"
     else:
         url_status = "✅ Available (Basic HTML extraction)"
     
     if PYPDF2_AVAILABLE:
-        pdf_status = "✅ Available"
+        if DOCX_AVAILABLE:
+            pdf_status = "✅ Available (PDF + DOCX support)"
+        else:
+            pdf_status = "✅ Available (PDF support)"
+    elif DOCX_AVAILABLE:
+        pdf_status = "✅ Available (DOCX support, PDF limited)"
     else:
         pdf_status = "⚠️ Limited (Text files only)"
     
@@ -566,9 +694,16 @@ with col1:
         file_types = ['txt', 'md', 'csv']
         if PYPDF2_AVAILABLE:
             file_types.append('pdf')
-            help_text = "Upload text files, Markdown, CSV, or PDF"
-        else:
-            help_text = "Upload text files, Markdown, or CSV (PDF requires PyPDF2)"
+        if DOCX_AVAILABLE:
+            file_types.append('docx')
+            
+        help_text = "Upload text files, Markdown, CSV"
+        if PYPDF2_AVAILABLE and DOCX_AVAILABLE:
+            help_text += ", PDF, or Word documents"
+        elif PYPDF2_AVAILABLE:
+            help_text += ", or PDF files"
+        elif DOCX_AVAILABLE:
+            help_text += ", or Word documents"
             
         uploaded_file = st.file_uploader(
             "Choose a file:",
@@ -638,23 +773,25 @@ with col2:
                 method_used = "AI-Powered (Hugging Face)" if use_ai and not summary.startswith("AI Error") else "Basic Text Processing"
                 
                 st.subheader("📊 Summary Statistics")
+                stats_text = f"""**📋 Mode:** {mode_info}
+
+**📊 Content Analysis:**
+• Original text: {original_words} words
+• Summary length: {final_words} words  
+• Compression ratio: {compression}% reduction
+
+**🎯 Target Achievement:**
+• Sentences: {final_sentences}/{target_sentences} {sentence_match}
+• Words: {final_words}/{target_words} {word_match}
+
+**⚡ Performance:**
+• Processing time: {processing_time:.1f} seconds
+• Method used: {method_used}
+• Priority: {summary_priority.title()}-first approach"""
+
                 st.markdown(f"""
                 <div class="stats-container">
-                    <strong>📋 Mode:</strong> {mode_info}<br><br>
-                    
-                    <strong>📊 Content Analysis:</strong><br>
-                    • Original text: {original_words} words<br>
-                    • Summary length: {final_words} words<br>
-                    • Compression ratio: {compression}% reduction<br><br>
-                    
-                    <strong>🎯 Target Achievement:</strong><br>
-                    • Sentences: {final_sentences}/{target_sentences} {sentence_match}<br>
-                    • Words: {final_words}/{target_words} {word_match}<br><br>
-                    
-                    <strong>⚡ Performance:</strong><br>
-                    • Processing time: {processing_time:.1f} seconds<br>
-                    • Method used: {method_used}<br>
-                    • Priority: {summary_priority.title()}-first approach
+                    {stats_text.replace('**', '<strong>').replace('**', '</strong>').replace('•', '&bull;')}
                 </div>
                 """, unsafe_allow_html=True)
                 
