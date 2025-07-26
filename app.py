@@ -17,6 +17,48 @@ try:
 except ImportError:
     PYPDF2_AVAILABLE = False
 
+# Basic URL content extraction without newspaper3k
+def extract_url_content_basic(url):
+    """Extract content from URL using basic requests and regex"""
+    try:
+        response = requests.get(url, timeout=10, headers={
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        })
+        response.raise_for_status()
+        
+        html = response.text
+        
+        # Basic HTML tag removal and text extraction
+        # Remove script and style tags
+        html = re.sub(r'<script.*?</script>', '', html, flags=re.DOTALL | re.IGNORECASE)
+        html = re.sub(r'<style.*?</style>', '', html, flags=re.DOTALL | re.IGNORECASE)
+        
+        # Remove HTML tags
+        text = re.sub(r'<[^>]+>', '', html)
+        
+        # Clean up whitespace
+        text = re.sub(r'\s+', ' ', text)
+        text = text.strip()
+        
+        # Basic content extraction - look for paragraphs
+        lines = text.split('\n')
+        content_lines = []
+        
+        for line in lines:
+            line = line.strip()
+            # Keep lines that are likely content (length check)
+            if len(line) > 50 and len(line) < 1000:
+                content_lines.append(line)
+        
+        if content_lines:
+            content = '\n'.join(content_lines[:20])  # Take first 20 good lines
+            return content, f"📰 Source: {url}"
+        else:
+            return text[:3000] if text else None, f"📰 Source: {url}"  # Fallback to first 3000 chars
+            
+    except Exception as e:
+        return None, f"❌ URL extraction failed: {str(e)}"
+
 # Page configuration
 st.set_page_config(
     page_title="Professional Text Summarizer",
@@ -296,38 +338,49 @@ def create_smart_summary(text, target_sentences, target_words, priority="sentenc
     return create_basic_summary(text, target_sentences, target_words)
 
 def process_uploaded_file(uploaded_file):
-    """Handle file uploads"""
-    if uploaded_file.type == "application/pdf" and not PYPDF2_AVAILABLE:
-        return None, "❌ PDF processing not available."
-        
+    """Handle file uploads with basic text extraction"""
     try:
         if uploaded_file.type == "application/pdf":
-            pdf_reader = PyPDF2.PdfReader(uploaded_file)
-            content = ""
-            for page in pdf_reader.pages:
-                content += page.extract_text() + "\n"
-            return content, f"📄 Source: {uploaded_file.name}"
+            if PYPDF2_AVAILABLE:
+                # Use PyPDF2 if available
+                pdf_reader = PyPDF2.PdfReader(uploaded_file)
+                content = ""
+                for page in pdf_reader.pages:
+                    content += page.extract_text() + "\n"
+                return content, f"📄 Source: {uploaded_file.name}"
+            else:
+                return None, "❌ PDF processing requires PyPDF2. Please try a text file or paste the content directly."
         else:
-            content = str(uploaded_file.read(), "utf-8")
-            return content, f"📝 Source: {uploaded_file.name}"
+            # Handle text files and other formats
+            try:
+                content = str(uploaded_file.read(), "utf-8")
+                return content, f"📝 Source: {uploaded_file.name}"
+            except UnicodeDecodeError:
+                # Try different encodings
+                uploaded_file.seek(0)
+                try:
+                    content = str(uploaded_file.read(), "latin-1")
+                    return content, f"📝 Source: {uploaded_file.name}"
+                except:
+                    return None, "❌ Could not decode file. Please try a UTF-8 encoded text file."
     except Exception as e:
         return None, f"❌ Error reading file: {str(e)}"
 
 def extract_url_content(url):
-    """Extract content from URL"""
-    if not NEWSPAPER_AVAILABLE:
-        return None, "❌ URL extraction not available."
-        
-    try:
-        article = Article(url)
-        article.download()
-        article.parse()
-        if article.text:
-            return article.text, f"📰 Source: {url}"
-        else:
-            return None, "❌ Could not extract text from URL"
-    except Exception as e:
-        return None, f"❌ URL processing failed: {str(e)}"
+    """Extract content from URL using available methods"""
+    if NEWSPAPER_AVAILABLE:
+        try:
+            article = Article(url)
+            article.download()
+            article.parse()
+            if article.text:
+                return article.text, f"📰 Source: {url}"
+        except Exception as e:
+            # Fall back to basic extraction
+            pass
+    
+    # Use basic extraction method
+    return extract_url_content_basic(url)
 
 # Main App Header
 st.markdown("""
@@ -369,19 +422,37 @@ with st.expander("🔑 Optional: Hugging Face API Setup (for better AI performan
 
 # Show system status
 with st.expander("🔧 System Status", expanded=False):
-    ai_status = "✅ Available (Hugging Face API)" if True else "❌ Not Available"
-    url_status = "✅ Available" if NEWSPAPER_AVAILABLE else "❌ Not Available"
-    pdf_status = "✅ Available" if PYPDF2_AVAILABLE else "❌ Not Available"
+    ai_status = "✅ Available (Hugging Face API)"
+    
+    if NEWSPAPER_AVAILABLE:
+        url_status = "✅ Available (Advanced)"
+    else:
+        url_status = "✅ Available (Basic HTML extraction)"
+    
+    if PYPDF2_AVAILABLE:
+        pdf_status = "✅ Available"
+    else:
+        pdf_status = "⚠️ Limited (Text files only)"
     
     st.markdown(f"""
     **📊 Feature Status:**
     
     - **AI Summarization:** {ai_status}
     - **URL Extraction:** {url_status}
-    - **PDF Processing:** {pdf_status}
+    - **File Processing:** {pdf_status}
     
-    {"🟢 **Full functionality available!**" if NEWSPAPER_AVAILABLE and PYPDF2_AVAILABLE else "🟡 **Partial functionality** - some features may be limited."}
+    **💡 Note:** All core features work! Some advanced features may have limitations without additional packages.
     """)
+    
+    if not NEWSPAPER_AVAILABLE or not PYPDF2_AVAILABLE:
+        st.markdown("""
+        <div class="warning-box">
+        <strong>🔧 To enable full features:</strong><br>
+        • For better URL extraction: <code>pip install newspaper3k</code><br>
+        • For PDF support: <code>pip install PyPDF2</code><br>
+        <em>Current setup works great for most use cases!</em>
+        </div>
+        """, unsafe_allow_html=True)
 
 # Sidebar for mode selection and controls
 with st.sidebar:
@@ -456,18 +527,11 @@ col1, col2 = st.columns([1, 1])
 with col1:
     st.header("📥 Input")
     
-    # Input options
-    available_methods = ["📄 Paste Text"]
-    if NEWSPAPER_AVAILABLE:
-        available_methods.append("🌐 URL")
-    if PYPDF2_AVAILABLE:
-        available_methods.append("📁 Upload File")
-    
-    if len(available_methods) == 1:
-        input_method = "📄 Paste Text"
-        st.info("ℹ️ Only text input is available. Install newspaper3k and PyPDF2 for URL and file support.")
-    else:
-        input_method = st.radio("Choose input method:", available_methods)
+    # Input options - Always show all methods now
+    input_method = st.radio(
+        "Choose input method:",
+        ["📄 Paste Text", "🌐 URL", "📁 Upload File"]
+    )
     
     content = ""
     source_info = ""
@@ -482,26 +546,34 @@ with col1:
             content = text_input
             source_info = "✍️ Source: Direct text input"
     
-    elif input_method == "🌐 URL" and NEWSPAPER_AVAILABLE:
+    elif input_method == "🌐 URL":
         url_input = st.text_input(
             "Enter article URL:",
-            placeholder="https://example.com/article"
+            placeholder="https://example.com/article",
+            help="Basic HTML extraction available - works with most news sites!"
         )
         if url_input.strip():
             with st.spinner("Extracting content from URL..."):
                 content, source_info = extract_url_content(url_input)
                 if content is None:
                     st.error(source_info)
+                elif "❌" in source_info:
+                    st.error(source_info)
+                else:
+                    st.success("✅ Content extracted successfully!")
     
-    elif input_method == "📁 Upload File" and PYPDF2_AVAILABLE:
-        file_types = ['txt']
+    elif input_method == "📁 Upload File":
+        file_types = ['txt', 'md', 'csv']
         if PYPDF2_AVAILABLE:
             file_types.append('pdf')
+            help_text = "Upload text files, Markdown, CSV, or PDF"
+        else:
+            help_text = "Upload text files, Markdown, or CSV (PDF requires PyPDF2)"
             
         uploaded_file = st.file_uploader(
             "Choose a file:",
             type=file_types,
-            help="Upload a text file" + (" or PDF" if PYPDF2_AVAILABLE else "")
+            help=help_text
         )
         if uploaded_file is not None:
             with st.spinner("Processing file..."):
@@ -715,8 +787,8 @@ with tab4:
     
     ### 🤖 Technology Status:
     - **AI Summarization:** ✅ Available (Hugging Face API)
-    - **URL Extraction:** {"✅ Available" if NEWSPAPER_AVAILABLE else "❌ Not Available"}
-    - **PDF Processing:** {"✅ Available" if PYPDF2_AVAILABLE else "❌ Not Available"}
+    - **URL Extraction:** ✅ Available (Basic HTML extraction + newspaper3k if installed)
+    - **File Processing:** ✅ Available (Text files always, PDF if PyPDF2 installed)
     
     ### 🚀 How It Works:
     1. **AI Mode:** Sends text to Hugging Face's BART model for intelligent summarization
