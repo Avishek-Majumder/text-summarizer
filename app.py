@@ -1,11 +1,36 @@
 import streamlit as st
-import torch
-from transformers import pipeline
-from newspaper import Article
-import PyPDF2
 import time
 import re
 import io
+
+# Try to import optional dependencies with fallbacks
+try:
+    import torch
+    TORCH_AVAILABLE = True
+except ImportError:
+    TORCH_AVAILABLE = False
+    st.warning("⚠️ PyTorch not available. Some features may be limited.")
+
+try:
+    from transformers import pipeline
+    TRANSFORMERS_AVAILABLE = True
+except ImportError:
+    TRANSFORMERS_AVAILABLE = False
+    st.error("❌ Transformers library not available. Please check your requirements.txt")
+
+try:
+    from newspaper import Article
+    NEWSPAPER_AVAILABLE = True
+except ImportError:
+    NEWSPAPER_AVAILABLE = False
+    st.warning("⚠️ Newspaper3k not available. URL extraction will be disabled.")
+
+try:
+    import PyPDF2
+    PYPDF2_AVAILABLE = True
+except ImportError:
+    PYPDF2_AVAILABLE = False
+    st.warning("⚠️ PyPDF2 not available. PDF upload will be disabled.")
 
 # Page configuration
 st.set_page_config(
@@ -47,25 +72,42 @@ st.markdown("""
 @st.cache_resource
 def load_summarization_model():
     """Load the BART model with caching for better performance"""
+    if not TRANSFORMERS_AVAILABLE:
+        return None
+        
     print("📦 Loading BART-large-cnn...")
     try:
+        # Try the smaller model first for Streamlit Cloud compatibility
         summarizer = pipeline(
             "summarization",
-            model="facebook/bart-large-cnn",
+            model="sshleifer/distilbart-cnn-12-6",
             device=-1  # Using CPU since GPU might not be available
         )
-        print("✅ BART loaded successfully!")
+        print("✅ DistilBART loaded successfully!")
         return summarizer
     except Exception as e:
-        print(f"❌ BART failed: {e}, trying backup model...")
-        # Fallback to smaller model if the large one fails
-        summarizer = pipeline("summarization", model="sshleifer/distilbart-cnn-12-6", device=-1)
-        return summarizer
+        print(f"❌ DistilBART failed: {e}, trying even smaller model...")
+        try:
+            # Fallback to an even smaller model
+            summarizer = pipeline(
+                "summarization", 
+                model="facebook/bart-large-cnn",
+                device=-1
+            )
+            return summarizer
+        except Exception as e2:
+            print(f"❌ All models failed: {e2}")
+            return None
 
 # Initialize the model
 if 'summarizer' not in st.session_state:
-    with st.spinner("Loading AI model... This might take a moment on first run."):
-        st.session_state.summarizer = load_summarization_model()
+    if TRANSFORMERS_AVAILABLE:
+        with st.spinner("Loading AI model... This might take a moment on first run."):
+            st.session_state.summarizer = load_summarization_model()
+            if st.session_state.summarizer is None:
+                st.error("❌ Failed to load AI model. Please check your internet connection and try again.")
+    else:
+        st.session_state.summarizer = None
 
 # Define preset configurations - keeping them exactly as in original
 PRESETS = {
@@ -149,6 +191,10 @@ def smart_paraphrase(text):
 
 def create_smart_summary(text, target_sentences, target_words, priority="sentences"):
     """Create summary with dual sentence/word targeting - exact same logic"""
+    
+    # Check if we have the required dependencies
+    if not TRANSFORMERS_AVAILABLE or st.session_state.summarizer is None:
+        return "❌ AI model not available. Please check your dependencies.", 0, 0
     
     print(f"🎯 Creating summary: {target_sentences} sentences, ~{target_words} words")
     print(f"📋 Priority: {priority}")
@@ -282,6 +328,9 @@ def create_smart_summary(text, target_sentences, target_words, priority="sentenc
 
 def process_uploaded_file(uploaded_file):
     """Handle file uploads - PDF and text files"""
+    if not PYPDF2_AVAILABLE and uploaded_file.type == "application/pdf":
+        return None, "❌ PDF processing not available. Please install PyPDF2."
+        
     try:
         if uploaded_file.type == "application/pdf":
             # Handle PDF files
@@ -299,6 +348,9 @@ def process_uploaded_file(uploaded_file):
 
 def extract_url_content(url):
     """Extract content from URL using newspaper3k"""
+    if not NEWSPAPER_AVAILABLE:
+        return None, "❌ URL extraction not available. Please install newspaper3k."
+        
     try:
         article = Article(url)
         article.download()
@@ -413,21 +465,28 @@ with col1:
             source_info = "✍️ Source: Direct text input"
     
     elif input_method == "🌐 URL":
-        url_input = st.text_input(
-            "Enter article URL:",
-            placeholder="https://example.com/article"
-        )
-        if url_input.strip():
-            with st.spinner("Extracting content from URL..."):
-                content, source_info = extract_url_content(url_input)
-                if content is None:
-                    st.error(source_info)
+        if not NEWSPAPER_AVAILABLE:
+            st.warning("⚠️ URL extraction is not available. Please install newspaper3k or use text input instead.")
+        else:
+            url_input = st.text_input(
+                "Enter article URL:",
+                placeholder="https://example.com/article"
+            )
+            if url_input.strip():
+                with st.spinner("Extracting content from URL..."):
+                    content, source_info = extract_url_content(url_input)
+                    if content is None:
+                        st.error(source_info)
     
     else:  # File upload
+        file_types = ['txt']
+        if PYPDF2_AVAILABLE:
+            file_types.append('pdf')
+            
         uploaded_file = st.file_uploader(
             "Choose a file:",
-            type=['txt', 'pdf'],
-            help="Upload a text file or PDF"
+            type=file_types,
+            help="Upload a text file" + (" or PDF" if PYPDF2_AVAILABLE else "")
         )
         if uploaded_file is not None:
             with st.spinner("Processing file..."):
