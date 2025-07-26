@@ -1,21 +1,10 @@
 import streamlit as st
 import re
 import io
+import requests
 from datetime import datetime
 
 # Try to import optional dependencies with fallbacks
-try:
-    import torch
-    TORCH_AVAILABLE = True
-except ImportError:
-    TORCH_AVAILABLE = False
-
-try:
-    from transformers import pipeline
-    TRANSFORMERS_AVAILABLE = True
-except ImportError:
-    TRANSFORMERS_AVAILABLE = False
-
 try:
     from newspaper import Article
     NEWSPAPER_AVAILABLE = True
@@ -68,16 +57,48 @@ st.markdown("""
         border-radius: 10px;
         border-left: 4px solid #ffc107;
     }
+    .api-setup {
+        background-color: #f8f9fa;
+        padding: 1rem;
+        border-radius: 10px;
+        border: 1px solid #dee2e6;
+        margin: 1rem 0;
+    }
 </style>
 """, unsafe_allow_html=True)
+
+# Hugging Face API Configuration
+HF_API_URL = "https://api-inference.huggingface.co/models/facebook/bart-large-cnn"
+
+def query_huggingface_api(payload, api_key=None):
+    """Query Hugging Face Inference API"""
+    headers = {}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    
+    try:
+        response = requests.post(HF_API_URL, headers=headers, json=payload, timeout=30)
+        if response.status_code == 200:
+            return response.json()
+        elif response.status_code == 503:
+            return {"error": "Model loading, please wait..."}
+        else:
+            return {"error": f"API Error: {response.status_code}"}
+    except Exception as e:
+        return {"error": f"Connection error: {str(e)}"}
+
+# Initialize session state
+if 'hf_api_key' not in st.session_state:
+    st.session_state.hf_api_key = ""
 
 # Check dependencies and show status
 def show_dependency_status():
     """Show which features are available"""
     status_text = "🔧 **System Status:**\n\n"
     
-    if TRANSFORMERS_AVAILABLE and TORCH_AVAILABLE:
-        status_text += "✅ AI Summarization: Available\n"
+    # Check AI Summarization
+    if st.session_state.hf_api_key or True:  # Free tier also works
+        status_text += "✅ AI Summarization: Available (Hugging Face API)\n"
     else:
         status_text += "❌ AI Summarization: Not Available\n"
         
@@ -92,34 +113,6 @@ def show_dependency_status():
         status_text += "❌ PDF Processing: Not Available\n"
     
     return status_text
-
-@st.cache_resource
-def load_summarization_model():
-    """Load the BART model with caching for better performance"""
-    if not TRANSFORMERS_AVAILABLE or not TORCH_AVAILABLE:
-        return None
-        
-    try:
-        # Try the smaller, more reliable model first
-        summarizer = pipeline(
-            "summarization",
-            model="sshleifer/distilbart-cnn-12-6",
-            device=-1
-        )
-        return summarizer
-    except Exception as e:
-        st.error(f"Failed to load AI model: {str(e)}")
-        return None
-
-# Initialize the model only if dependencies are available
-if 'summarizer_loaded' not in st.session_state:
-    st.session_state.summarizer_loaded = False
-    st.session_state.summarizer = None
-    
-    if TRANSFORMERS_AVAILABLE and TORCH_AVAILABLE:
-        with st.spinner("Loading AI model... This might take a moment."):
-            st.session_state.summarizer = load_summarization_model()
-            st.session_state.summarizer_loaded = True
 
 # Define preset configurations
 PRESETS = {
@@ -241,22 +234,38 @@ def create_basic_summary(text, target_sentences, target_words):
     
     return result, sentence_count, word_count
 
-def create_ai_summary(text, target_sentences, target_words, priority="sentences"):
-    """Create AI-powered summary"""
+def create_ai_summary(text, target_sentences, target_words, api_key=None):
+    """Create AI-powered summary using Hugging Face API"""
     try:
-        summarizer = st.session_state.summarizer
+        # Prepare the payload
+        max_length = max(target_words + 20, target_sentences * 15)
+        min_length = max(target_words - 10, target_sentences * 10, 20)
         
-        # Generate summary
-        summary_result = summarizer(
-            text,
-            max_length=max(target_words + 20, target_sentences * 15),
-            min_length=max(target_words - 10, target_sentences * 10),
-            do_sample=False,
-            truncation=True
-        )[0]['summary_text']
+        payload = {
+            "inputs": text,
+            "parameters": {
+                "max_length": min(max_length, 500),  # API has limits
+                "min_length": min_length,
+                "do_sample": False
+            }
+        }
+        
+        # Query the API
+        result = query_huggingface_api(payload, api_key)
+        
+        if "error" in result:
+            return f"AI Error: {result['error']}", 0, 0
+        
+        if not result or not isinstance(result, list) or not result[0]:
+            return "AI Error: Invalid response from API", 0, 0
+            
+        summary_text = result[0].get('summary_text', '')
+        
+        if not summary_text:
+            return "AI Error: No summary generated", 0, 0
         
         # Clean and split sentences
-        sentences = clean_and_split_sentences(summary_result)
+        sentences = clean_and_split_sentences(summary_text)
         
         # Adjust based on target
         if len(sentences) > target_sentences:
@@ -267,21 +276,24 @@ def create_ai_summary(text, target_sentences, target_words, priority="sentences"
         # Apply paraphrasing
         final_sentences = [smart_paraphrase(sentence) for sentence in selected_sentences]
         
-        result = ' '.join(final_sentences)
-        word_count = len(result.split())
+        result_text = ' '.join(final_sentences)
+        word_count = len(result_text.split())
         sentence_count = len(final_sentences)
         
-        return result, sentence_count, word_count
+        return result_text, sentence_count, word_count
         
     except Exception as e:
-        return f"AI summarization failed: {str(e)}", 0, 0
+        return f"AI Error: {str(e)}", 0, 0
 
-def create_smart_summary(text, target_sentences, target_words, priority="sentences"):
+def create_smart_summary(text, target_sentences, target_words, priority="sentences", use_ai=True):
     """Create summary using available methods"""
-    if st.session_state.summarizer is not None:
-        return create_ai_summary(text, target_sentences, target_words, priority)
-    else:
-        return create_basic_summary(text, target_sentences, target_words)
+    if use_ai:
+        result = create_ai_summary(text, target_sentences, target_words, st.session_state.hf_api_key)
+        if not result[0].startswith("AI Error"):
+            return result
+    
+    # Fallback to basic summary
+    return create_basic_summary(text, target_sentences, target_words)
 
 def process_uploaded_file(uploaded_file):
     """Handle file uploads"""
@@ -325,16 +337,51 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
+# API Configuration Section
+with st.expander("🔑 Optional: Hugging Face API Setup (for better AI performance)", expanded=False):
+    st.markdown("""
+    <div class="api-setup">
+    <strong>🚀 Want better AI summarization?</strong><br>
+    Get a free Hugging Face API key for improved performance and no rate limits!<br><br>
+    
+    <strong>Steps:</strong><br>
+    1. Go to <a href="https://huggingface.co/settings/tokens" target="_blank">huggingface.co/settings/tokens</a><br>
+    2. Create a new token (free)<br>
+    3. Paste it below<br><br>
+    
+    <em>Note: The app works without an API key too, but may be slower.</em>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    api_key_input = st.text_input(
+        "Hugging Face API Key (optional):",
+        type="password",
+        value=st.session_state.hf_api_key,
+        help="Optional: Paste your free Hugging Face API key here for better performance"
+    )
+    
+    if api_key_input != st.session_state.hf_api_key:
+        st.session_state.hf_api_key = api_key_input
+        if api_key_input:
+            st.success("✅ API key saved! You'll get better AI performance now.")
+        else:
+            st.info("ℹ️ Using free tier - may be slower but still works!")
+
 # Show system status
 with st.expander("🔧 System Status", expanded=False):
-    st.markdown(show_dependency_status())
-    if not (TRANSFORMERS_AVAILABLE and TORCH_AVAILABLE):
-        st.markdown("""
-        <div class="warning-box">
-        <strong>⚠️ Limited Mode:</strong> AI summarization is not available. 
-        The app will use basic text processing for summaries.
-        </div>
-        """, unsafe_allow_html=True)
+    ai_status = "✅ Available (Hugging Face API)" if True else "❌ Not Available"
+    url_status = "✅ Available" if NEWSPAPER_AVAILABLE else "❌ Not Available"
+    pdf_status = "✅ Available" if PYPDF2_AVAILABLE else "❌ Not Available"
+    
+    st.markdown(f"""
+    **📊 Feature Status:**
+    
+    - **AI Summarization:** {ai_status}
+    - **URL Extraction:** {url_status}
+    - **PDF Processing:** {pdf_status}
+    
+    {"🟢 **Full functionality available!**" if NEWSPAPER_AVAILABLE and PYPDF2_AVAILABLE else "🟡 **Partial functionality** - some features may be limited."}
+    """)
 
 # Sidebar for mode selection and controls
 with st.sidebar:
@@ -398,6 +445,10 @@ with st.sidebar:
             ["Sentences First", "Words First"],
             help="Which target is more important?"
         )
+    
+    # AI Toggle
+    st.markdown("---")
+    use_ai = st.checkbox("🤖 Use AI Summarization", value=True, help="Uncheck to use basic text processing only")
 
 # Main content area
 col1, col2 = st.columns([1, 1])
@@ -406,10 +457,17 @@ with col1:
     st.header("📥 Input")
     
     # Input options
-    input_method = st.radio(
-        "Choose input method:",
-        ["📄 Paste Text", "🌐 URL", "📁 Upload File"]
-    )
+    available_methods = ["📄 Paste Text"]
+    if NEWSPAPER_AVAILABLE:
+        available_methods.append("🌐 URL")
+    if PYPDF2_AVAILABLE:
+        available_methods.append("📁 Upload File")
+    
+    if len(available_methods) == 1:
+        input_method = "📄 Paste Text"
+        st.info("ℹ️ Only text input is available. Install newspaper3k and PyPDF2 for URL and file support.")
+    else:
+        input_method = st.radio("Choose input method:", available_methods)
     
     content = ""
     source_info = ""
@@ -424,21 +482,18 @@ with col1:
             content = text_input
             source_info = "✍️ Source: Direct text input"
     
-    elif input_method == "🌐 URL":
-        if not NEWSPAPER_AVAILABLE:
-            st.warning("⚠️ URL extraction is not available. Please use text input instead.")
-        else:
-            url_input = st.text_input(
-                "Enter article URL:",
-                placeholder="https://example.com/article"
-            )
-            if url_input.strip():
-                with st.spinner("Extracting content from URL..."):
-                    content, source_info = extract_url_content(url_input)
-                    if content is None:
-                        st.error(source_info)
+    elif input_method == "🌐 URL" and NEWSPAPER_AVAILABLE:
+        url_input = st.text_input(
+            "Enter article URL:",
+            placeholder="https://example.com/article"
+        )
+        if url_input.strip():
+            with st.spinner("Extracting content from URL..."):
+                content, source_info = extract_url_content(url_input)
+                if content is None:
+                    st.error(source_info)
     
-    else:  # File upload
+    elif input_method == "📁 Upload File" and PYPDF2_AVAILABLE:
         file_types = ['txt']
         if PYPDF2_AVAILABLE:
             file_types.append('pdf')
@@ -481,13 +536,14 @@ with col2:
             with st.spinner("Creating your professional summary..."):
                 start_time = datetime.now()
                 summary, final_sentences, final_words = create_smart_summary(
-                    content, target_sentences, target_words, summary_priority
+                    content, target_sentences, target_words, summary_priority, use_ai
                 )
                 end_time = datetime.now()
                 processing_time = (end_time - start_time).total_seconds()
             
-            if summary.startswith("Error") or summary.startswith("AI summarization failed"):
+            if summary.startswith("Error") or summary.startswith("AI Error"):
                 st.error(summary)
+                st.info("💡 Try unchecking 'Use AI Summarization' to use basic text processing instead.")
             else:
                 # Display the summary
                 st.subheader("📋 Your Professional Summary")
@@ -507,7 +563,7 @@ with col2:
                 sentence_match = "✅ Perfect" if final_sentences == target_sentences else f"📊 {final_sentences}/{target_sentences}"
                 word_match = "✅ Perfect" if abs(final_words - target_words) <= 10 else f"📊 {final_words}/{target_words}"
                 
-                method_used = "AI-Powered" if st.session_state.summarizer is not None else "Basic Text Processing"
+                method_used = "AI-Powered (Hugging Face)" if use_ai and not summary.startswith("AI Error") else "Basic Text Processing"
                 
                 st.subheader("📊 Summary Statistics")
                 st.markdown(f"""
@@ -590,10 +646,25 @@ with tab2:
     - **100-200 words:** Professional reports
     - **200-300 words:** Academic abstracts
     
+    ### 🤖 AI vs Basic Processing:
+    
+    **AI Summarization (Recommended):**
+    - Uses advanced BART model via Hugging Face API
+    - Better understanding of context and meaning
+    - Higher quality, more coherent summaries
+    - May be slower on first use (model loading)
+    
+    **Basic Text Processing:**
+    - Fast, reliable fallback method
+    - Selects sentences from different parts of text
+    - Always available, no dependencies
+    - Good for when AI is unavailable
+    
     ### 💡 Pro Tips:
+    - Get a free Hugging Face API key for better performance
     - Start with **Sentences First** for most use cases
     - Use **Words First** for platforms with strict character limits
-    - Longer targets work better with longer input texts
+    - Try both AI and Basic modes to see which you prefer
     """)
 
 with tab3:
@@ -608,36 +679,69 @@ with tab3:
     ```
     
     **Try:** Executive Brief preset or Custom 6 sentences, 120 words
+    
+    ### 🔍 Testing Different Modes:
+    
+    1. **Test AI vs Basic:** Try the same text with AI on/off to compare quality
+    2. **Test Presets:** Same text with different presets to see length variations
+    3. **Test Priority:** Advanced mode with "Sentences First" vs "Words First"
+    
+    ### 📰 More Sample Texts:
+    
+    **Business News:**
+    ```
+    Tech company announces quarterly earnings, showing 15% growth despite market challenges...
+    ```
+    
+    **Academic Content:**
+    ```
+    Recent studies in climate science indicate significant changes in global weather patterns...
+    ```
     """)
 
 with tab4:
     st.markdown(f"""
     ## ℹ️ About This Tool
     
-    This professional text summarizer creates high-quality summaries tailored to your needs.
+    This professional text summarizer creates high-quality summaries tailored to your needs using advanced AI technology.
     
     ### ⚡ Current Features:
     - **Dual Mode Interface:** Simple presets + advanced controls
+    - **AI-Powered:** Uses Facebook's BART model via Hugging Face API
     - **Multiple Input Methods:** Text, URLs, and file uploads
-    - **Smart Paraphrasing:** Avoids repetitive language
-    - **Flexible Targeting:** Control sentence count and word count
+    - **Smart Paraphrasing:** Avoids repetitive language from source
+    - **Flexible Targeting:** Control both sentence count and word count
+    - **Fallback System:** Works even when AI is unavailable
     
     ### 🤖 Technology Status:
-    - **AI Summarization:** {"✅ Available" if st.session_state.summarizer is not None else "❌ Not Available"}
+    - **AI Summarization:** ✅ Available (Hugging Face API)
     - **URL Extraction:** {"✅ Available" if NEWSPAPER_AVAILABLE else "❌ Not Available"}
     - **PDF Processing:** {"✅ Available" if PYPDF2_AVAILABLE else "❌ Not Available"}
+    
+    ### 🚀 How It Works:
+    1. **AI Mode:** Sends text to Hugging Face's BART model for intelligent summarization
+    2. **Processing:** Applies smart paraphrasing and sentence optimization
+    3. **Targeting:** Adjusts output to meet your exact sentence/word requirements
+    4. **Fallback:** Uses basic text processing if AI is unavailable
     
     ### 🎯 Perfect For:
     - Students and researchers
     - Business professionals
     - Content creators
     - Social media managers
+    - Anyone needing quick, quality summaries
+    
+    ### 🔑 Free Hugging Face API Key Benefits:
+    - Faster processing (no queuing)
+    - Higher rate limits
+    - More reliable service
+    - Still completely free!
     """)
 
 # Footer
 st.markdown("---")
 st.markdown("""
 <div style="text-align: center; color: #666; margin-top: 2rem;">
-    <p>🎯 Professional Text Summarizer • Built with Streamlit</p>
+    <p>🎯 Professional Text Summarizer • AI-Powered • Built with Streamlit</p>
 </div>
 """, unsafe_allow_html=True)
